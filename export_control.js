@@ -34,9 +34,10 @@ const CONFIG = {
     hws_cooldown_period: 30,    // minutes - Prevent rapid cycling
 
     // Reset to export priority logic
-    export_target_percentage: 10,  // % - If daily export < this % of target AND battery charging
+    export_target_percentage: 40,  // % - If daily export < this % of target AND battery charging
     battery_charging_threshold: 50, // W - Minimum power to consider "charging" (noise filter)
     min_generation_for_export: 500, // W - Minimum solar generation needed to switch to export mode
+    evening_self_consume_soc_threshold: 30, // % - Min SOC + buffer to enable evening self-consume
 
     // Safety & Data Validation
     data_freshness_limit: 5,    // minutes - Max age of data before fallback
@@ -49,7 +50,14 @@ const CONFIG = {
     night_end_hour: 6,          // Hour (24h format) when night period ends
 
     // Debug
-    enable_debug: true
+    enable_debug: true,
+
+    // Persistent Logging
+    enable_persistent_logging: true,
+    max_log_entries: 500,       // Keep last 500 log entries
+    log_hws_changes: true,      // Log all HWS on/off events
+    log_state_changes: true,    // Log all state transitions
+    log_daily_summary: true     // Log daily summary at midnight
 };
 
 // =============================================================================
@@ -68,37 +76,63 @@ const STATES = {
 // HELPER FUNCTIONS
 // =============================================================================
 
-function updateDailyExportHistory(dailyExport, targetExport) {
-    // Get current date in YYYY-MM-DD format
-    const currentDate = new Date().toISOString().split('T')[0];
+// --- Local Time Helpers for EST (GMT+10) ---
+function getLocalDate(offsetHours = 10) {
+    // Returns a Date object adjusted to GMT+10 (EST)
+    const now = new Date();
+    // Get UTC time in ms, add offset in ms
+    const localTime = new Date(now.getTime() + (offsetHours * 60 * 60 * 1000));
+    return localTime;
+}
 
-    // Get existing history (use file storage for persistence)
+function getLocalISOString(offsetHours = 10) {
+    // Returns ISO string in GMT+10 (EST)
+    const local = getLocalDate(offsetHours);
+    return local.toISOString().replace('Z', '+10:00');
+}
+
+function getLocalDateString(offsetHours = 10) {
+    // Returns YYYY-MM-DD in GMT+10 (EST)
+    const local = getLocalDate(offsetHours);
+    return local.toISOString().split('T')[0];
+}
+
+function updateDailyExportHistory(dailyExport, targetExport) {
+    // Get current date in YYYY-MM-DD format (local EST)
+    const currentDate = getLocalDateString();
+
+    // Always clear the in-memory version to avoid confusion
+    global.set('export_history_30days', undefined);
+
+    // Get existing history (use file storage for persistence only)
     let exportHistory = global.get('export_history_30days', 'file') || [];
 
-    // Check if we already have an entry for today
+    // Only update if today's entry does not exist (prevents multiple updates per day)
     const todayIndex = exportHistory.findIndex(entry => entry.date === currentDate);
+    if (todayIndex >= 0) {
+        // Already updated today, do not update again
+        if (CONFIG.enable_debug) {
+            node.log(`Export history for today (${currentDate}) already updated. Skipping.`);
+        }
+        return exportHistory;
+    }
 
     const todayEntry = {
         date: currentDate,
         export: dailyExport,
         target: targetExport,
-        timestamp: new Date().toISOString()
+        timestamp: getLocalISOString()
     };
 
-    if (todayIndex >= 0) {
-        // Update existing entry for today
-        exportHistory[todayIndex] = todayEntry;
-    } else {
-        // Add new entry for today
-        exportHistory.push(todayEntry);
-    }
+    // Add new entry for today
+    exportHistory.push(todayEntry);
 
     // Keep only the last 30 days
     exportHistory = exportHistory
         .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime())
         .slice(-30);
 
-    // Save back to persistent storage
+    // Save back to persistent storage (file only)
     global.set('export_history_30days', exportHistory, 'file');
 
     if (CONFIG.enable_debug) {
@@ -110,14 +144,13 @@ function updateDailyExportHistory(dailyExport, targetExport) {
 
 function getCurrentMonthTarget() {
     // First try to use existing calculation if available and recent
-    const targetCalc = global.get('target_calculation');
+    const targetCalc = global.get('target_calculation', 'file');
     if (targetCalc && targetCalc.method === "rolling_30day" && targetCalc.adjusted_target) {
         return targetCalc.adjusted_target; // Use adaptive target
     }
 
     // Calculate adaptive rolling target if not available or outdated
     const exportHistory = global.get('export_history_30days', 'file') || [];
-
     if (exportHistory.length > 0) {
         // Use up to 30 days, minimum 3 days for reliable calculation
         const daysToUse = Math.min(exportHistory.length, 30);
@@ -132,7 +165,7 @@ function getCurrentMonthTarget() {
             const rollingAverage = totalExport / daysToUse;
 
             // Get static monthly target for comparison
-            const currentMonth = new Date().getMonth() + 1;
+            const currentMonth = getLocalDate().getMonth() + 1;
             const staticMonthlyTarget = MONTHLY_EXPORT_TARGETS[currentMonth] || 25.0;
 
             // Calculate adaptive adjustment
@@ -162,7 +195,7 @@ function getCurrentMonthTarget() {
                 method: "rolling_30day",
                 rolling_days: daysToUse,
                 rolling_export_total: totalExport,
-                calculation_date: new Date().toISOString(),
+                calculation_date: getLocalISOString(),
                 data_points: daysToUse,
                 adjustment_reason: performance < 0.9 ? 'under_performing' :
                     performance > 1.1 ? 'over_performing' : 'normal'
@@ -179,7 +212,7 @@ function getCurrentMonthTarget() {
     }
 
     // Fall back to static monthly table if insufficient history
-    const currentMonth = new Date().getMonth() + 1;
+    const currentMonth = getLocalDate().getMonth() + 1;
     const staticTarget = MONTHLY_EXPORT_TARGETS[currentMonth] || 25.0;
 
     if (CONFIG.enable_debug) {
@@ -204,7 +237,7 @@ function shouldResetToExportPriority(dailyExport, targetExport, batteryPower) {
 }
 
 function isNightTime() {
-    const currentHour = new Date().getHours();
+    const currentHour = getLocalDate().getHours();
 
     if (CONFIG.night_start_hour > CONFIG.night_end_hour) {
         // Night period crosses midnight (e.g., 20:00 to 06:00)
@@ -257,6 +290,88 @@ function initializeStateIfNeeded() {
     return currentState;
 }
 
+function addPersistentLog(logType, message, data = {}) {
+    if (!CONFIG.enable_persistent_logging) return;
+
+    // Get existing logs
+    let logs = global.get('energy_management_logs', 'file') || [];
+
+    // Create log entry
+    const logEntry = {
+        timestamp: getLocalISOString(),
+        type: logType,
+        message: message,
+        data: data,
+        date: getLocalDateString() // For easy daily filtering
+    };
+
+    // Add to logs
+    logs.push(logEntry);
+
+    // Keep only recent entries
+    if (logs.length > CONFIG.max_log_entries) {
+        logs = logs.slice(-CONFIG.max_log_entries);
+    }
+
+    // Save back to persistent storage
+    global.set('energy_management_logs', logs, 'file');
+
+    // Also log to Node-RED console if debug enabled
+    if (CONFIG.enable_debug) {
+        node.log(`[${logType}] ${message}`);
+    }
+}
+
+function logHWSEvent(action, reason, hwsStatus, batterySoc, generation) {
+    if (!CONFIG.log_hws_changes) return;
+
+    addPersistentLog('HWS_EVENT', `HWS ${action}: ${reason}`, {
+        hws_status: hwsStatus,
+        battery_soc: batterySoc,
+        generation: generation,
+        action: action,
+        reason: reason
+    });
+}
+
+function logStateChange(fromState, toState, reason, inputs) {
+    if (!CONFIG.log_state_changes) return;
+
+    addPersistentLog('STATE_CHANGE', `${fromState} → ${toState}: ${reason}`, {
+        from_state: fromState,
+        to_state: toState,
+        reason: reason,
+        daily_export: inputs.dailyExport,
+        target_export: inputs.targetExport,
+        battery_soc: inputs.batterySoc,
+        generation: inputs.generation,
+        battery_power: inputs.batteryPower
+    });
+}
+
+function logDailySummary(dailyExport, targetExport, inputs) {
+    if (!CONFIG.log_daily_summary) return;
+
+    const currentHour = getLocalDate().getHours();
+    // Only log summary once around midnight (23:00-01:00)
+    if (currentHour >= 23 || currentHour <= 1) {
+        const lastSummary = global.get('last_daily_summary_date', 'file') || '';
+        const today = getLocalDateString();
+
+        if (lastSummary !== today) {
+            addPersistentLog('DAILY_SUMMARY', `Daily Summary: ${dailyExport.toFixed(1)}/${targetExport.toFixed(1)} kWh`, {
+                daily_export: dailyExport,
+                target_export: targetExport,
+                target_achieved: dailyExport >= targetExport,
+                battery_soc_end: inputs.batterySoc,
+                performance_percent: ((dailyExport / targetExport) * 100).toFixed(1)
+            });
+
+            global.set('last_daily_summary_date', today, 'file');
+        }
+    }
+}
+
 function getHWSCooldownStatus() {
     const lastHWSoff = global.get('hws_last_off_time') || 0;
     const cooldownExpired = (Date.now() - lastHWSoff) > (CONFIG.hws_cooldown_period * 60 * 1000);
@@ -306,6 +421,12 @@ function processStateTransition(currentState, inputs) {
                 if (exportTargetReached) {
                     nextState = STATES.BATTERY_STORAGE;
                     stateReason = `Export target ${targetExport.toFixed(1)}kWh reached, switching to battery storage`;
+                } else if (generation < CONFIG.min_generation_for_export &&
+                    batterySoc > CONFIG.evening_self_consume_soc_threshold &&
+                    !batteryCharging) {
+                    // Evening with low/no solar but battery has charge - self consume instead of grid import
+                    nextState = STATES.SELF_CONSUME;
+                    stateReason = `Low solar (${generation}W), target not reached, but battery has charge (${batterySoc}%) - self consume to avoid grid import`;
                 } else {
                     stateReason = `Export priority: ${dailyExport.toFixed(1)}/${targetExport.toFixed(1)}kWh exported`;
                 }
@@ -347,7 +468,11 @@ function processStateTransition(currentState, inputs) {
                 break;
 
             case STATES.SELF_CONSUME:
-                if (batteryCharging && !exportTargetReached) {
+                if (batterySoc <= CONFIG.min_soc_threshold) {
+                    // Battery protection - switch off ESS mode to prevent over-discharge
+                    nextState = STATES.EXPORT_PRIORITY;
+                    stateReason = `Battery at min SOC (${batterySoc}%) - disabling ESS mode to protect battery`;
+                } else if (batteryCharging && !exportTargetReached) {
                     nextState = STATES.EXPORT_PRIORITY;
                     stateReason = `Battery charging and export target not reached - back to export priority`;
                 } else if (batteryCharging && exportTargetReached) {
@@ -382,7 +507,7 @@ function generateOutput(state, inputs, stateReason) {
     } = inputs;
 
     let output = {
-        timestamp: new Date().toISOString(),
+        timestamp: getLocalISOString(),
         current_state: state,
         actions: {
             set_ess_mode: false,
@@ -430,12 +555,23 @@ function generateOutput(state, inputs, stateReason) {
 
             if (!hwsStatus && cooldownExpired && !socDropped && !generationDropped) {
                 output.actions.enable_hws = true;
+                logHWSEvent('TURNED_ON', 'Battery full, excess generation available, cooldown expired', true, batterySoc, generation);
             } else if (hwsStatus && (socDropped || generationDropped)) {
                 output.actions.enable_hws = false;
                 global.set('hws_last_off_time', Date.now());
+                logHWSEvent('TURNED_OFF', socDropped ? `SOC dropped to ${batterySoc}%` : `Generation dropped to ${generation}W`, false, batterySoc, generation);
             } else {
                 output.actions.enable_hws = hwsStatus; // Maintain current state
+                if (hwsStatus) {
+                    addPersistentLog('HWS_STATUS', `HWS remains ON: SOC ${batterySoc}%, Gen ${generation}W`, {
+                        hws_status: true,
+                        battery_soc: batterySoc,
+                        generation: generation,
+                        reason: 'maintaining_current_state'
+                    });
+                }
             }
+            break;
             break;
 
         case STATES.SELF_CONSUME:
@@ -463,7 +599,7 @@ try {
     if (energyManagementEnabled === false) {
         // Module is disabled - return disabled status
         msg.payload = {
-            timestamp: new Date().toISOString(),
+            timestamp: getLocalISOString(),
             current_state: 'DISABLED',
             actions: {
                 set_ess_mode: false,
@@ -489,7 +625,6 @@ try {
 
     // Initialize and get current state (with persistence protection)
     const currentState = initializeStateIfNeeded();
-
     // Get target for current month
     const targetExport = getCurrentMonthTarget();
 
@@ -514,7 +649,7 @@ try {
 
         // Return safe mode for invalid data
         msg.payload = {
-            timestamp: new Date().toISOString(),
+            timestamp: getLocalISOString(),
             current_state: STATES.SAFE_MODE,
             actions: {
                 set_ess_mode: false,
@@ -536,10 +671,14 @@ try {
     // Update global state if changed
     if (nextState !== currentState) {
         global.set('energy_management_state', nextState);
+        logStateChange(currentState, nextState, stateReason, inputs);
         if (CONFIG.enable_debug) {
             node.warn(`State change: ${currentState} → ${nextState}`);
         }
     }
+
+    // Log daily summary (once per day around midnight)
+    logDailySummary(dailyExport, targetExport, inputs);
 
     // Generate output
     const output = generateOutput(nextState, inputs, stateReason);
@@ -554,7 +693,7 @@ try {
 } catch (error) {
     node.error(`Energy Management Error: ${error.message}`);
     msg.payload = {
-        timestamp: new Date().toISOString(),
+        timestamp: getLocalISOString(),
         current_state: STATES.SAFE_MODE,
         actions: {
             set_ess_mode: false,
