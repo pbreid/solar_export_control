@@ -36,8 +36,13 @@ const CONFIG = {
     // Reset to export priority logic
     export_target_percentage: 40,  // % - If daily export < this % of target AND battery charging
     battery_charging_threshold: 50, // W - Minimum power to consider "charging" (noise filter)
+    strong_charging_threshold: 1000, // W - Strong battery charging indicates significant excess solar
     min_generation_for_export: 500, // W - Minimum solar generation needed to switch to export mode
+    min_generation_to_stay_export: 300, // W - Minimum generation to stay in export mode (hysteresis)
     evening_self_consume_soc_threshold: 30, // % - Min SOC + buffer to enable evening self-consume
+
+    // State change debouncing
+    state_change_debounce_time: 5,   // minutes - Conditions must persist before switching states
 
     // Safety & Data Validation
     data_freshness_limit: 5,    // minutes - Max age of data before fallback
@@ -95,6 +100,61 @@ function getLocalDateString(offsetHours = 10) {
     // Returns YYYY-MM-DD in GMT+10 (EST)
     const local = getLocalDate(offsetHours);
     return local.toISOString().split('T')[0];
+}
+
+// --- Debouncing Functions ---
+function checkStateChangeDebounce(targetState, currentState, reason) {
+    if (targetState === currentState) {
+        return { allowed: true, reason: 'No state change required' };
+    }
+    
+    const now = Date.now();
+    const stateChangeKey = `${currentState}_to_${targetState}`;
+    const lastRequestTime = global.get(`state_change_request_${stateChangeKey}`) || 0;
+    const debounceMs = CONFIG.state_change_debounce_time * 60 * 1000;
+    
+    if (lastRequestTime === 0) {
+        // First request for this transition
+        global.set(`state_change_request_${stateChangeKey}`, now);
+        addPersistentLog('DEBOUNCE', `State change request started: ${currentState} → ${targetState}`, {
+            transition: stateChangeKey,
+            reason: reason,
+            debounce_time: CONFIG.state_change_debounce_time
+        });
+        return { allowed: false, reason: `Debouncing state change (${CONFIG.state_change_debounce_time}min required)` };
+    }
+    
+    const timeSinceRequest = now - lastRequestTime;
+    if (timeSinceRequest >= debounceMs) {
+        // Debounce period satisfied
+        global.set(`state_change_request_${stateChangeKey}`, 0); // Reset
+        addPersistentLog('DEBOUNCE', `State change approved: ${currentState} → ${targetState}`, {
+            transition: stateChangeKey,
+            time_waited: Math.round(timeSinceRequest / 1000),
+            reason: reason
+        });
+        return { allowed: true, reason: 'Debounce period satisfied' };
+    } else {
+        // Still in debounce period
+        const remainingTime = Math.round((debounceMs - timeSinceRequest) / 1000);
+        return { 
+            allowed: false, 
+            reason: `Debouncing (${remainingTime}s remaining)` 
+        };
+    }
+}
+
+function clearOtherStateChangeRequests(allowedTransition) {
+    // Clear any other pending state change requests when one is approved
+    const allStates = Object.values(STATES);
+    allStates.forEach(fromState => {
+        allStates.forEach(toState => {
+            const transition = `${fromState}_to_${toState}`;
+            if (transition !== allowedTransition) {
+                global.set(`state_change_request_${transition}`, 0);
+            }
+        });
+    });
 }
 
 function updateDailyExportHistory(dailyExport, targetExport) {
@@ -231,7 +291,7 @@ function getExcessGeneration(generation, gridPower) {
 
 function shouldResetToExportPriority(dailyExport, targetExport, batteryPower) {
     const exportPercentage = (dailyExport / targetExport) * 100;
-    const batteryCharging = batteryPower > CONFIG.battery_charging_threshold;
+    const batteryCharging = batteryPower > CONFIG.strong_charging_threshold; // Changed to use strong charging threshold
 
     return exportPercentage < CONFIG.export_target_percentage && batteryCharging;
 }
@@ -403,17 +463,50 @@ function processStateTransition(currentState, inputs) {
     let stateReason = '';
 
     // Check for reset to export priority first (can happen from any state)
-    // Priority 1: If export target not reached, we should prioritize export (BUT NOT DURING NIGHT AND ONLY WITH MEANINGFUL SOLAR)
-    if (!exportTargetReached && !isNightTime() && generation >= CONFIG.min_generation_for_export) {
+    // Priority 1: If export target not reached, we should prioritize export (BUT NOT DURING NIGHT AND ONLY WITH MEANINGFUL SOLAR + STRONG CHARGING)
+    if (!exportTargetReached && !isNightTime() && 
+        (generation >= CONFIG.min_generation_for_export || batteryPower >= CONFIG.strong_charging_threshold)) {
         if (currentState !== STATES.EXPORT_PRIORITY) {
-            nextState = STATES.EXPORT_PRIORITY;
-            stateReason = `Reset to export priority: Daily export ${dailyExport.toFixed(1)}kWh has not reached target ${targetExport.toFixed(1)}kWh with ${generation}W generation available`;
+            const debounceCheck = checkStateChangeDebounce(STATES.EXPORT_PRIORITY, currentState, 
+                `Daily export ${dailyExport.toFixed(1)}kWh has not reached target ${targetExport.toFixed(1)}kWh with ${generation}W generation and ${batteryPower}W battery power`);
+            
+            if (debounceCheck.allowed) {
+                nextState = STATES.EXPORT_PRIORITY;
+                stateReason = `Reset to export priority: ${debounceCheck.reason}`;
+                clearOtherStateChangeRequests(`${currentState}_to_${STATES.EXPORT_PRIORITY}`);
+            } else {
+                stateReason = `Export priority requested but ${debounceCheck.reason}`;
+            }
         }
     }
-    // Priority 2: Additional reset condition for when significantly below target and battery charging (NOT DURING NIGHT AND WITH SOLAR)
-    else if (shouldResetToExportPriority(dailyExport, targetExport, batteryPower) && !isNightTime() && generation >= CONFIG.min_generation_for_export) {
-        nextState = STATES.EXPORT_PRIORITY;
-        stateReason = `Reset to export priority: Daily export ${dailyExport.toFixed(1)}kWh < ${CONFIG.export_target_percentage}% of target ${targetExport.toFixed(1)}kWh and battery charging >${CONFIG.battery_charging_threshold}W with ${generation}W generation`;
+    // Priority 2: Additional reset condition for when significantly below target and battery charging (NOT DURING NIGHT AND WITH STRONG SOLAR OR CHARGING)
+    else if (shouldResetToExportPriority(dailyExport, targetExport, batteryPower) && !isNightTime() && 
+             (generation >= CONFIG.min_generation_for_export || batteryPower >= CONFIG.strong_charging_threshold)) {
+        const debounceCheck = checkStateChangeDebounce(STATES.EXPORT_PRIORITY, currentState,
+            `Daily export ${dailyExport.toFixed(1)}kWh < ${CONFIG.export_target_percentage}% of target ${targetExport.toFixed(1)}kWh and battery charging >${CONFIG.battery_charging_threshold}W with ${generation}W generation and ${batteryPower}W battery power`);
+        
+        if (debounceCheck.allowed) {
+            nextState = STATES.EXPORT_PRIORITY;
+            stateReason = `Reset to export priority: ${debounceCheck.reason}`;
+            clearOtherStateChangeRequests(`${currentState}_to_${STATES.EXPORT_PRIORITY}`);
+        } else {
+            stateReason = `Export priority requested but ${debounceCheck.reason}`;
+        }
+    }
+    // Priority 3: Hysteresis check - if in EXPORT_PRIORITY, check both generation AND battery power before switching away
+    else if (currentState === STATES.EXPORT_PRIORITY && !isNightTime() && 
+             generation < CONFIG.min_generation_to_stay_export && 
+             batteryPower < CONFIG.battery_charging_threshold) {
+        const debounceCheck = checkStateChangeDebounce(STATES.SELF_CONSUME, currentState,
+            `Generation dropped to ${generation}W below stay threshold (${CONFIG.min_generation_to_stay_export}W) and battery power only ${batteryPower}W`);
+        
+        if (debounceCheck.allowed) {
+            nextState = STATES.SELF_CONSUME;
+            stateReason = `Low generation and weak battery charging: ${debounceCheck.reason}`;
+            clearOtherStateChangeRequests(`${currentState}_to_${STATES.SELF_CONSUME}`);
+        } else {
+            stateReason = `Self consume requested but ${debounceCheck.reason}`;
+        }
     }
     else {
         switch (currentState) {
@@ -572,7 +665,6 @@ function generateOutput(state, inputs, stateReason) {
                 }
             }
             break;
-            break;
 
         case STATES.SELF_CONSUME:
             output.actions.set_ess_mode = true;  // Keep ESS mode active for self-consumption
@@ -588,6 +680,7 @@ function generateOutput(state, inputs, stateReason) {
 
     return output;
 }
+
 
 // =============================================================================
 // MAIN EXECUTION
