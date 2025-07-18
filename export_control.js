@@ -49,10 +49,16 @@ const CONFIG = {
     max_reasonable_soc: 105,    // % - Upper bound for SOC validation
     min_reasonable_soc: -5,     // % - Lower bound for SOC validation
     max_reasonable_power: 50000, // W - Upper bound for power validation
+    
+    // Stale generation data protection
+    significant_export_threshold: 2000, // W - If exporting >2kW, assume generation is working regardless of sensor
 
     // Time-based logic
     night_start_hour: 20,       // Hour (24h format) when night period starts
     night_end_hour: 6,          // Hour (24h format) when night period ends
+
+    catchup_aggressiveness: 0.75,  // 0.5 = moderate, 1.0 = full compensation, 1.5 = very aggressive
+
 
     // Debug
     enable_debug: true,
@@ -233,17 +239,20 @@ function getCurrentMonthTarget() {
             const performance = rollingAverage / staticMonthlyTarget; // Performance ratio
 
             if (performance < 0.9) {
-                // Under-performing (< 90% of monthly target) - increase target to catch up
-                const catchUpFactor = 1.1 + (0.9 - performance); // 10% base + additional based on shortfall
-                adjustedTarget = rollingAverage * catchUpFactor;
-                adjustedTarget = Math.min(adjustedTarget, staticMonthlyTarget * 1.3); // Cap at 130% of monthly
+                // Under-performing (< 90% of monthly target) - set target above monthly to catch up
+                const shortfall = staticMonthlyTarget - rollingAverage; // How much behind per day
+                const catchUpBoost = shortfall * CONFIG.catchup_aggressiveness; // Take % of shortfall and add to monthly target
+                adjustedTarget = staticMonthlyTarget + catchUpBoost;
+                adjustedTarget = Math.min(adjustedTarget, staticMonthlyTarget * 1.5); // Cap at 150% of monthly
             } else if (performance > 1.1) {
-                // Over-performing (> 110% of monthly target) - reduce target to balance
-                const coolDownFactor = 0.95 - (performance - 1.1) * 0.1; // Reduce based on excess
-                adjustedTarget = rollingAverage * Math.max(coolDownFactor, 0.8); // Floor at 80% of average
+                // Over-performing (> 110% of monthly target) - can reduce target slightly
+                const excess = rollingAverage - staticMonthlyTarget; // How much ahead per day
+                const coolDownReduction = excess * 0.3; // Take 30% of excess off monthly target
+                adjustedTarget = staticMonthlyTarget - coolDownReduction;
+                adjustedTarget = Math.max(adjustedTarget, staticMonthlyTarget * 0.8); // Floor at 80% of monthly
             } else {
-                // Within normal range (90-110%) - use rolling average
-                adjustedTarget = rollingAverage;
+                // Within normal range (90-110%) - use monthly target
+                adjustedTarget = staticMonthlyTarget;
             }
 
             // Store the calculation for future use (persistent storage)
@@ -461,6 +470,23 @@ function processStateTransition(currentState, inputs) {
 
     let nextState = currentState;
     let stateReason = '';
+
+    // PRIORITY 0: Stale generation data protection
+    // If we're exporting significantly but generation shows low/zero, trust the grid data
+    if (currentState === STATES.EXPORT_PRIORITY && gridPower < -CONFIG.significant_export_threshold) {
+        // Strong export indicates generation is working, maintain export state regardless of generation sensor
+        nextState = currentState;
+        stateReason = `Maintaining export state: exporting ${Math.abs(gridPower)}W (generation sensor possibly stale: ${generation}W)`;
+        
+        addPersistentLog('DATA_PROTECTION', `Generation data suspicious: ${generation}W reported but exporting ${Math.abs(gridPower)}W`, {
+            reported_generation: generation,
+            grid_power: gridPower,
+            battery_power: batteryPower,
+            action: 'maintaining_export_state'
+        });
+        
+        return { nextState, stateReason };
+    }
 
     // Check for reset to export priority first (can happen from any state)
     // Priority 1: If export target not reached, we should prioritize export (BUT NOT DURING NIGHT AND ONLY WITH MEANINGFUL SOLAR + STRONG CHARGING)
@@ -680,7 +706,6 @@ function generateOutput(state, inputs, stateReason) {
 
     return output;
 }
-
 
 // =============================================================================
 // MAIN EXECUTION
