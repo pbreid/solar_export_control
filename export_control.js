@@ -56,10 +56,7 @@ const CONFIG = {
     // Time-based logic
     night_start_hour: 20,       // Hour (24h format) when night period starts
     night_end_hour: 6,          // Hour (24h format) when night period ends
-
     catchup_aggressiveness: 0.75,  // 0.5 = moderate, 1.0 = full compensation, 1.5 = very aggressive
-
-
     // Debug
     enable_debug: true,
 
@@ -241,7 +238,7 @@ function getCurrentMonthTarget() {
             if (performance < 0.9) {
                 // Under-performing (< 90% of monthly target) - set target above monthly to catch up
                 const shortfall = staticMonthlyTarget - rollingAverage; // How much behind per day
-                const catchUpBoost = shortfall * CONFIG.catchup_aggressiveness; // Take % of shortfall and add to monthly target
+                const catchUpBoost = shortfall * 0.5; // Take 50% of shortfall and add to monthly target
                 adjustedTarget = staticMonthlyTarget + catchUpBoost;
                 adjustedTarget = Math.min(adjustedTarget, staticMonthlyTarget * 1.5); // Cap at 150% of monthly
             } else if (performance > 1.1) {
@@ -472,17 +469,57 @@ function processStateTransition(currentState, inputs) {
     let stateReason = '';
 
     // PRIORITY 0: Stale generation data protection
-    // If we're exporting significantly but generation shows low/zero, trust the grid data
-    if (currentState === STATES.EXPORT_PRIORITY && gridPower < -CONFIG.significant_export_threshold) {
-        // Strong export indicates generation is working, maintain export state regardless of generation sensor
+    // If we're exporting significantly but generation shows suspiciously low values, trust the grid data
+    const exportingSignificantly = gridPower < -CONFIG.significant_export_threshold;
+    const generationSuspicious = generation < 500; // Generation seems too low for significant export
+    const generationDataStale = exportingSignificantly && generationSuspicious;
+    
+    if (currentState === STATES.EXPORT_PRIORITY && generationDataStale) {
+        // Strong export but very low/zero generation indicates stale data
         nextState = currentState;
-        stateReason = `Maintaining export state: exporting ${Math.abs(gridPower)}W (generation sensor possibly stale: ${generation}W)`;
+        stateReason = `Maintaining export state: exporting ${Math.abs(gridPower)}W but generation sensor shows only ${generation}W (likely stale)`;
         
-        addPersistentLog('DATA_PROTECTION', `Generation data suspicious: ${generation}W reported but exporting ${Math.abs(gridPower)}W`, {
+        addPersistentLog('DATA_PROTECTION', `Generation data appears stale: ${generation}W reported but exporting ${Math.abs(gridPower)}W`, {
             reported_generation: generation,
             grid_power: gridPower,
             battery_power: batteryPower,
             action: 'maintaining_export_state'
+        });
+        
+        return { nextState, stateReason };
+    }
+
+    // PRIORITY 1: Battery Protection Override - Only when discharging at low SOC
+    // When battery is critically low AND discharging AND export target not reached, force EXPORT_PRIORITY
+    if (batterySoc <= CONFIG.min_soc_threshold && batteryPower < 0 && !exportTargetReached && currentState !== STATES.EXPORT_PRIORITY) {
+        nextState = STATES.EXPORT_PRIORITY;
+        stateReason = `Battery protection override: SOC ${batterySoc}% ≤ ${CONFIG.min_soc_threshold}% and discharging ${batteryPower}W - forcing export priority to prevent over-discharge`;
+        
+        addPersistentLog('BATTERY_PROTECTION', `Battery protection override triggered: SOC ${batterySoc}%, discharging ${batteryPower}W`, {
+            battery_soc: batterySoc,
+            battery_power: batteryPower,
+            export_target_reached: exportTargetReached,
+            daily_export: dailyExport,
+            target_export: targetExport,
+            previous_state: currentState,
+            action: 'forced_export_priority'
+        });
+        
+        return { nextState, stateReason };
+    }
+    
+    // PRIORITY 2: Battery Protection when target IS reached - only if discharging
+    // When battery is critically low AND discharging BUT export target reached, switch to grid import
+    if (batterySoc <= CONFIG.min_soc_threshold && batteryPower < 0 && exportTargetReached && currentState === STATES.SELF_CONSUME) {
+        nextState = STATES.EXPORT_PRIORITY;
+        stateReason = `Battery protection: SOC ${batterySoc}% ≤ ${CONFIG.min_soc_threshold}% and discharging - disabling ESS to prevent over-discharge`;
+        
+        addPersistentLog('BATTERY_PROTECTION', `Battery protection (target reached): SOC ${batterySoc}%, discharging ${batteryPower}W`, {
+            battery_soc: batterySoc,
+            battery_power: batteryPower,
+            export_target_reached: exportTargetReached,
+            previous_state: currentState,
+            action: 'disable_ess_protection'
         });
         
         return { nextState, stateReason };
@@ -587,11 +624,7 @@ function processStateTransition(currentState, inputs) {
                 break;
 
             case STATES.SELF_CONSUME:
-                if (batterySoc <= CONFIG.min_soc_threshold) {
-                    // Battery protection - switch off ESS mode to prevent over-discharge
-                    nextState = STATES.EXPORT_PRIORITY;
-                    stateReason = `Battery at min SOC (${batterySoc}%) - disabling ESS mode to protect battery`;
-                } else if (batteryCharging && !exportTargetReached) {
+                if (batteryCharging && !exportTargetReached) {
                     nextState = STATES.EXPORT_PRIORITY;
                     stateReason = `Battery charging and export target not reached - back to export priority`;
                 } else if (batteryCharging && exportTargetReached) {
