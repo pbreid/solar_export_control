@@ -206,86 +206,98 @@ function updateDailyExportHistory(dailyExport, targetExport) {
 }
 
 function getCurrentMonthTarget() {
-    // First try to use existing calculation if available and recent
-    const targetCalc = global.get('target_calculation', 'file');
-    if (targetCalc && targetCalc.method === "rolling_30day" && targetCalc.adjusted_target) {
-        return targetCalc.adjusted_target; // Use adaptive target
-    }
-
-    // Calculate adaptive rolling target if not available or outdated
+    // Always try to use rolling calculation if we have any history
     const exportHistory = global.get('export_history_30days', 'file') || [];
+    
     if (exportHistory.length > 0) {
-        // Use up to 30 days, minimum 3 days for reliable calculation
+        // Use up to 30 days, minimum 1 day for calculation (no minimum threshold)
         const daysToUse = Math.min(exportHistory.length, 30);
+        const recentHistory = exportHistory.slice(-daysToUse);
 
-        if (daysToUse >= 3) { // Need minimum data for adaptive logic
-            const recentHistory = exportHistory.slice(-daysToUse);
+        // Calculate rolling average (base target)
+        const totalExport = recentHistory.reduce((sum, day) => {
+            return sum + (day.export || 0);
+        }, 0);
+        const rollingAverage = totalExport / daysToUse;
 
-            // Calculate rolling average (base target)
-            const totalExport = recentHistory.reduce((sum, day) => {
-                return sum + (day.export || 0);
-            }, 0);
-            const rollingAverage = totalExport / daysToUse;
+        // Get current month's static target for performance comparison
+        const currentMonth = getLocalDate().getMonth() + 1;
+        const staticMonthlyTarget = MONTHLY_EXPORT_TARGETS[currentMonth] || 25.0;
 
-            // Get static monthly target for comparison
-            const currentMonth = getLocalDate().getMonth() + 1;
-            const staticMonthlyTarget = MONTHLY_EXPORT_TARGETS[currentMonth] || 25.0;
+        // Calculate adaptive adjustment based on current month's target
+        let adjustedTarget;
+        const performance = rollingAverage / staticMonthlyTarget; // Performance ratio against current month
 
-            // Calculate adaptive adjustment
-            let adjustedTarget;
-            const performance = rollingAverage / staticMonthlyTarget; // Performance ratio
-
-            if (performance < 0.9) {
-                // Under-performing (< 90% of monthly target) - set target above monthly to catch up
-                const shortfall = staticMonthlyTarget - rollingAverage; // How much behind per day
-                const catchUpBoost = shortfall * 0.5; // Take 50% of shortfall and add to monthly target
-                adjustedTarget = staticMonthlyTarget + catchUpBoost;
-                adjustedTarget = Math.min(adjustedTarget, staticMonthlyTarget * 1.5); // Cap at 150% of monthly
-            } else if (performance > 1.1) {
-                // Over-performing (> 110% of monthly target) - can reduce target slightly
-                const excess = rollingAverage - staticMonthlyTarget; // How much ahead per day
-                const coolDownReduction = excess * 0.3; // Take 30% of excess off monthly target
-                adjustedTarget = staticMonthlyTarget - coolDownReduction;
-                adjustedTarget = Math.max(adjustedTarget, staticMonthlyTarget * 0.8); // Floor at 80% of monthly
-            } else {
-                // Within normal range (90-110%) - use monthly target
-                adjustedTarget = staticMonthlyTarget;
-            }
-
-            // Store the calculation for future use (persistent storage)
-            const calculatedTarget = {
-                base_target: rollingAverage,
-                adjusted_target: adjustedTarget,
-                static_monthly_target: staticMonthlyTarget,
-                performance_ratio: performance,
-                method: "rolling_30day",
-                rolling_days: daysToUse,
-                rolling_export_total: totalExport,
-                calculation_date: getLocalISOString(),
-                data_points: daysToUse,
-                adjustment_reason: performance < 0.9 ? 'under_performing' :
-                    performance > 1.1 ? 'over_performing' : 'normal'
-            };
-
-            global.set('target_calculation', calculatedTarget, 'file');
-
-            if (CONFIG.enable_debug) {
-                node.warn(`Adaptive target: ${adjustedTarget.toFixed(1)} kWh (avg: ${rollingAverage.toFixed(1)}, monthly: ${staticMonthlyTarget.toFixed(1)}, performance: ${(performance * 100).toFixed(1)}%)`);
-            }
-
-            return adjustedTarget;
+        if (performance < 0.9) {
+            // Under-performing (< 90% of current month target) - set target above monthly to catch up
+            const shortfall = staticMonthlyTarget - rollingAverage; // How much behind per day
+            const catchUpBoost = shortfall * 0.5; // Take 50% of shortfall and add to monthly target
+            adjustedTarget = staticMonthlyTarget + catchUpBoost;
+            adjustedTarget = Math.min(adjustedTarget, staticMonthlyTarget * 1.5); // Cap at 150% of monthly
+        } else if (performance > 1.1) {
+            // Over-performing (> 110% of current month target) - can reduce target slightly
+            const excess = rollingAverage - staticMonthlyTarget; // How much ahead per day
+            const coolDownReduction = excess * 0.3; // Take 30% of excess off monthly target
+            adjustedTarget = staticMonthlyTarget - coolDownReduction;
+            adjustedTarget = Math.max(adjustedTarget, staticMonthlyTarget * 0.8); // Floor at 80% of monthly
+        } else {
+            // Within normal range (90-110%) - use current month target
+            adjustedTarget = staticMonthlyTarget;
         }
+
+        // Store the calculation for future use (persistent storage)
+        const calculatedTarget = {
+            base_target: rollingAverage,
+            adjusted_target: adjustedTarget,
+            static_monthly_target: staticMonthlyTarget,
+            performance_ratio: performance,
+            method: "rolling_30day",
+            rolling_days: daysToUse,
+            rolling_export_total: totalExport,
+            calculation_date: getLocalISOString(),
+            data_points: daysToUse,
+            adjustment_reason: performance < 0.9 ? 'under_performing' :
+                performance > 1.1 ? 'over_performing' : 'normal',
+            shortfall_per_day: performance < 0.9 ? staticMonthlyTarget - rollingAverage : 0,
+            excess_per_day: performance > 1.1 ? rollingAverage - staticMonthlyTarget : 0,
+            catchup_boost: performance < 0.9 ? adjustedTarget - staticMonthlyTarget : 0,
+            mixed_month_data: daysToUse > 1 ? checkForMixedMonthData(recentHistory) : false
+        };
+
+        global.set('target_calculation', calculatedTarget, 'file');
+
+        if (CONFIG.enable_debug) {
+            const mixedMonthInfo = calculatedTarget.mixed_month_data ? ' (mixed month data)' : '';
+            node.warn(`Adaptive target: ${adjustedTarget.toFixed(1)} kWh (avg: ${rollingAverage.toFixed(1)}, monthly: ${staticMonthlyTarget.toFixed(1)}, performance: ${(performance * 100).toFixed(1)}%)${mixedMonthInfo}`);
+        }
+
+        return adjustedTarget;
     }
 
-    // Fall back to static monthly table if insufficient history
+    // Fall back to static monthly table only if no history available at all
     const currentMonth = getLocalDate().getMonth() + 1;
     const staticTarget = MONTHLY_EXPORT_TARGETS[currentMonth] || 25.0;
 
     if (CONFIG.enable_debug) {
-        node.warn(`Using static monthly target: ${staticTarget} kWh (insufficient history for adaptive calculation)`);
+        node.warn(`Using static monthly target: ${staticTarget} kWh (no export history available)`);
     }
 
     return staticTarget;
+}
+
+function checkForMixedMonthData(historyArray) {
+    // Check if the rolling window contains data from multiple months
+    const months = new Set();
+    historyArray.forEach(entry => {
+        const month = new Date(entry.date).getMonth() + 1;
+        months.add(month);
+    });
+    
+    return {
+        has_mixed_months: months.size > 1,
+        months_included: Array.from(months).sort(),
+        month_count: months.size
+    };
 }
 
 function getExcessGeneration(generation, gridPower) {
