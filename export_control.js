@@ -56,7 +56,7 @@ const CONFIG = {
     // Time-based logic
     night_start_hour: 20,       // Hour (24h format) when night period starts
     night_end_hour: 6,          // Hour (24h format) when night period ends
-    catchup_aggressiveness: 0.75,  // 0.5 = moderate, 1.0 = full compensation, 1.5 = very aggressive
+
     // Debug
     enable_debug: true,
 
@@ -65,7 +65,10 @@ const CONFIG = {
     max_log_entries: 500,       // Keep last 500 log entries
     log_hws_changes: true,      // Log all HWS on/off events
     log_state_changes: true,    // Log all state transitions
-    log_daily_summary: true     // Log daily summary at midnight
+    log_daily_summary: true,    // Log daily summary at midnight
+    
+    // Adaptive Targets
+    catchup_days: 5             // Days over which to distribute catch-up deficit
 };
 
 // =============================================================================
@@ -229,11 +232,20 @@ function getCurrentMonthTarget() {
         const performance = rollingAverage / staticMonthlyTarget; // Performance ratio against current month
 
         if (performance < 0.9) {
-            // Under-performing (< 90% of current month target) - set target above monthly to catch up
+            // Under-performing (< 90% of monthly target) - catch up over next few days
             const shortfall = staticMonthlyTarget - rollingAverage; // How much behind per day
-            const catchUpBoost = shortfall * 0.5; // Take 50% of shortfall and add to monthly target
-            adjustedTarget = staticMonthlyTarget + catchUpBoost;
-            adjustedTarget = Math.min(adjustedTarget, staticMonthlyTarget * 1.5); // Cap at 150% of monthly
+            
+            // Calculate total deficit accumulated over the rolling period
+            const expectedTotal = staticMonthlyTarget * daysToUse;
+            const actualTotal = totalExport;
+            const totalDeficit = expectedTotal - actualTotal;
+            
+            // Catch up over next few days (configurable)
+            const catchupDays = CONFIG.catchup_days || 5; // Default 5 days to catch up
+            const catchupPerDay = totalDeficit / catchupDays;
+            
+            adjustedTarget = staticMonthlyTarget + catchupPerDay;
+            adjustedTarget = Math.min(adjustedTarget, staticMonthlyTarget * 2.0); // Cap at 200% of monthly
         } else if (performance > 1.1) {
             // Over-performing (> 110% of current month target) - can reduce target slightly
             const excess = rollingAverage - staticMonthlyTarget; // How much ahead per day
@@ -250,6 +262,7 @@ function getCurrentMonthTarget() {
             base_target: rollingAverage,
             adjusted_target: adjustedTarget,
             static_monthly_target: staticMonthlyTarget,
+            monthly_export_target: staticMonthlyTarget * new Date(getLocalDate().getFullYear(), getLocalDate().getMonth() + 1, 0).getDate(), // Total month target
             performance_ratio: performance,
             method: "rolling_30day",
             rolling_days: daysToUse,
@@ -260,7 +273,9 @@ function getCurrentMonthTarget() {
                 performance > 1.1 ? 'over_performing' : 'normal',
             shortfall_per_day: performance < 0.9 ? staticMonthlyTarget - rollingAverage : 0,
             excess_per_day: performance > 1.1 ? rollingAverage - staticMonthlyTarget : 0,
-            catchup_boost: performance < 0.9 ? adjustedTarget - staticMonthlyTarget : 0,
+            total_deficit: performance < 0.9 ? (staticMonthlyTarget * daysToUse) - totalExport : 0,
+            catchup_per_day: performance < 0.9 ? adjustedTarget - staticMonthlyTarget : 0,
+            catchup_days_used: CONFIG.catchup_days || 5,
             mixed_month_data: daysToUse > 1 ? checkForMixedMonthData(recentHistory) : false
         };
 
